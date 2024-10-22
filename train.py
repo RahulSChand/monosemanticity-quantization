@@ -1,19 +1,19 @@
 # %%
-from utils import *
+from my_utils import *
+import torch
+import tqdm
 # %%
 encoder = AutoEncoder(cfg)
 buffer = Buffer(cfg)
 # Code used to remove the "rare freq direction", the shared direction among the ultra low frequency features. 
 # I experimented with removing it and retraining the autoencoder. 
-if cfg["remove_rare_dir"]:
-    rare_freq_dir = torch.load("rare_freq_dir.pt")
-    rare_freq_dir.requires_grad = False
+
 
 # %%
 try:
-    wandb.init(project="autoencoder", entity="neelnanda-io")
+    wandb.init(project="sparse_encoder", name="orig")
     num_batches = cfg["num_tokens"] // cfg["batch_size"]
-    # model_num_batches = cfg["model_batch_size"] * num_batches
+    
     encoder_optim = torch.optim.Adam(encoder.parameters(), lr=cfg["lr"], betas=(cfg["beta1"], cfg["beta2"]))
     recons_scores = []
     act_freq_scores_list = []

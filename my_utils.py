@@ -1,12 +1,21 @@
 # %%
 import os
-os.environ["TRANSFORMERS_CACHE"] = "/workspace/cache/"
-os.environ["DATASETS_CACHE"] = "/workspace/cache/"
 # %%
 import wandb
 from transformer_lens import utils, HookedTransformer
 import torch
 import numpy as np
+import json
+import pprint
+import random
+import torch.nn as nn
+import torch.nn.functional as F
+import einops
+from datasets import load_dataset
+from functools import partial
+from pathlib import Path
+
+import tqdm
 # %%
 import argparse
 def arg_parse_update_cfg(default_cfg):
@@ -37,9 +46,11 @@ def arg_parse_update_cfg(default_cfg):
     print("Updated config")
     print(json.dumps(cfg, indent=2))
     return cfg
+
+
 default_cfg = {
     "seed": 49,
-    "batch_size": 4096,
+    "batch_size": 2048,
     "buffer_mult": 384,
     "lr": 1e-4,
     "num_tokens": int(2e9),
@@ -85,6 +96,12 @@ torch.set_grad_enabled(True)
 
 model = HookedTransformer.from_pretrained(cfg["model_name"]).to(DTYPES[cfg["enc_dtype"]]).to(cfg["device"])
 
+# for name, param in model.named_parameters():
+#     if "block" in name and "W" in name:
+#         torch.nn.init.kaiming_uniform_(param.data)
+
+# model.load_state_dict(torch.load("quant_4_f.bin"))
+
 n_layers = model.cfg.n_layers
 d_model = model.cfg.d_model
 n_heads = model.cfg.n_heads
@@ -103,7 +120,7 @@ def get_acts(tokens, batch_size=1024):
 # sub, acts = get_acts(torch.arange(20).reshape(2, 10), batch_size=3)
 # sub.shape, acts.shape
 # %%
-SAVE_DIR = Path("/workspace/1L-Sparse-Autoencoder/checkpoints")
+SAVE_DIR = Path("orig")
 class AutoEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -155,8 +172,8 @@ class AutoEncoder(nn.Module):
         print("Saved as version", version)
     
     @classmethod
-    def load(cls, version):
-        cfg = (json.load(open(SAVE_DIR/(str(version)+"_cfg.json"), "r")))
+    def load(cls, version, save_dir):
+        cfg = (json.load(open(save_dir + "/" + str(version)+"_cfg.json", "r")))
         pprint.pprint(cfg)
         self = cls(cfg=cfg)
         self.load_state_dict(torch.load(SAVE_DIR/(str(version)+".pt")))
@@ -190,25 +207,26 @@ def shuffle_data(all_tokens):
     print("Shuffled data")
     return all_tokens[torch.randperm(all_tokens.shape[0])]
 
-
-
 loading_data_first_time = False
-if loading_data_first_time:
-    data = load_dataset("NeelNanda/c4-code-tokenized-2b", split="train", cache_dir="/workspace/cache/")
-    data.save_to_disk("/workspace/data/c4_code_tokenized_2b.hf")
-    data.set_format(type="torch", columns=["tokens"])
-    all_tokens = data["tokens"]
-    all_tokens.shape
+# if loading_data_first_time:
 
-
-    all_tokens_reshaped = einops.rearrange(all_tokens, "batch (x seq_len) -> (batch x) seq_len", x=8, seq_len=128)
-    all_tokens_reshaped[:, 0] = model.tokenizer.bos_token_id
-    all_tokens_reshaped = all_tokens_reshaped[torch.randperm(all_tokens_reshaped.shape[0])]
-    torch.save(all_tokens_reshaped, "/workspace/data/c4_code_2b_tokens_reshaped.pt")
-else:
-    # data = datasets.load_from_disk("/workspace/data/c4_code_tokenized_2b.hf")
-    all_tokens = torch.load("/workspace/data/c4_code_2b_tokens_reshaped.pt")
-    all_tokens = shuffle_data(all_tokens)
+data = load_dataset("NeelNanda/c4-code-20k", split="train")
+# data.save_to_disk("data/c4_code_tokenized_2b.hf")
+# data.set_format(type="torch", columns=["tokens"])
+# all_tokens = data["tokens"]
+# all_tokens.shape
+tokenized_data = utils.tokenize_and_concatenate(data, model.tokenizer, max_length=128)
+tokenized_data = tokenized_data.shuffle(42)
+all_tokens = tokenized_data["tokens"]
+all_tokens_reshaped = all_tokens
+# all_tokens_reshaped = einops.rearrange(all_tokens, "batch (x seq_len) -> (batch x) seq_len", x=8, seq_len=128)
+all_tokens_reshaped[:, 0] = model.tokenizer.bos_token_id
+all_tokens_reshaped = all_tokens_reshaped[torch.randperm(all_tokens_reshaped.shape[0])]
+# torch.save(all_tokens_reshaped, "data/c4_code_2b_tokens_reshaped.pt")
+# else:
+#     # data = datasets.load_from_disk("/workspace/data/c4_code_tokenized_2b.hf")
+#     all_tokens = torch.load("/data/c4_code_2b_tokens_reshaped.pt")
+#     all_tokens = shuffle_data(all_tokens)
 
 # %%
 class Buffer():
@@ -273,8 +291,7 @@ def zero_ablate_hook(mlp_post, hook):
 
 @torch.no_grad()
 def get_recons_loss(num_batches=5, local_encoder=None):
-    if local_encoder is None:
-        local_encoder = encoder
+    
     loss_list = []
     for i in range(num_batches):
         tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
@@ -291,14 +308,13 @@ def get_recons_loss(num_batches=5, local_encoder=None):
     print(f"{score:.2%}")
     # print(f"{((zero_abl_loss - mean_abl_loss)/(zero_abl_loss - loss)).item():.2%}")
     return score, loss, recons_loss, zero_abl_loss
-# print(get_recons_loss())
+
 
 # %%
 # Frequency
 @torch.no_grad()
 def get_freqs(num_batches=25, local_encoder=None):
-    if local_encoder is None:
-        local_encoder = encoder
+    
     act_freq_scores = torch.zeros(local_encoder.d_hidden, dtype=torch.float32).to(cfg["device"])
     total = 0
     for i in tqdm.trange(num_batches):
